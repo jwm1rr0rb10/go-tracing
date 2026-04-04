@@ -14,7 +14,7 @@ import (
 var instrumentedHandlers sync.Map
 
 // Middleware adds OpenTelemetry tracing to HTTP handlers.
-// It uses "METHOD /path" as the span name and caches the instrumented handler for performance.
+// Span name = "METHOD /path". Handler is cached for performance.
 func Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uri := r.URL.Path
@@ -23,13 +23,11 @@ func Middleware(next http.Handler) http.Handler {
 		}
 		operation := r.Method + " " + uri
 
-		// Fast path: reuse cached handler
 		if h, ok := instrumentedHandlers.Load(operation); ok {
 			h.(http.Handler).ServeHTTP(w, r)
 			return
 		}
 
-		// First time for this route → wrap and cache
 		h := otelhttp.NewHandler(
 			next,
 			operation,
@@ -41,42 +39,27 @@ func Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// === gRPC Server Interceptors ===
+// ====================== gRPC Tracing (new StatsHandler API) ======================
 
-// UnaryServerInterceptor returns a gRPC unary server interceptor with OpenTelemetry tracing.
-func UnaryServerInterceptor() grpc.UnaryServerInterceptor {
-	return otelgrpc.UnaryServerInterceptor(
-		otelgrpc.WithPropagators(otel.GetTextMapPropagator()),
+// WithServerTracing return option for gRPC-server with full OpenTelemetry tracing.
+func WithServerTracing() grpc.ServerOption {
+	return grpc.StatsHandler(
+		otelgrpc.NewServerHandler(
+			otelgrpc.WithPropagators(otel.GetTextMapPropagator()),
+		),
 	)
 }
 
-// StreamServerInterceptor returns a gRPC stream server interceptor with OpenTelemetry tracing.
-func StreamServerInterceptor() grpc.StreamServerInterceptor {
-	return otelgrpc.StreamServerInterceptor(
-		otelgrpc.WithPropagators(otel.GetTextMapPropagator()),
+// WithClientTracing return option for gRPC-клиента with full OpenTelemetry tracing.
+func WithClientTracing() grpc.DialOption {
+	return grpc.WithStatsHandler(
+		otelgrpc.NewClientHandler(
+			otelgrpc.WithPropagators(otel.GetTextMapPropagator()),
+		),
 	)
 }
 
-// WithAllTracing is a convenience for servers that want both unary and stream tracing.
+// WithAllTracing — useful func for server(using recommendation).
 func WithAllTracing() []grpc.ServerOption {
-	return []grpc.ServerOption{
-		grpc.UnaryInterceptor(UnaryServerInterceptor()),
-		grpc.StreamInterceptor(StreamServerInterceptor()),
-	}
-}
-
-// === gRPC Client Interceptors ===
-
-// UnaryClientInterceptor returns a gRPC unary client interceptor with OpenTelemetry tracing.
-func UnaryClientInterceptor() grpc.UnaryClientInterceptor {
-	return otelgrpc.UnaryClientInterceptor(
-		otelgrpc.WithPropagators(otel.GetTextMapPropagator()),
-	)
-}
-
-// StreamClientInterceptor returns a gRPC stream client interceptor with OpenTelemetry tracing.
-func StreamClientInterceptor() grpc.StreamClientInterceptor {
-	return otelgrpc.StreamClientInterceptor(
-		otelgrpc.WithPropagators(otel.GetTextMapPropagator()),
-	)
+	return []grpc.ServerOption{WithServerTracing()}
 }
