@@ -206,6 +206,8 @@ ctx, childSpan := tracing.Continue(ctx, "sub-operation")
 
 ## License
 
+[MIT License](https://github.com/jwm1rr0rb10/go-tracing/blob/main/LICENSE) – © Raman Zaitsau [@jwm1rrr0rb10](https://github.com/jwm1rr0rb10)
+
 
 ---
 
