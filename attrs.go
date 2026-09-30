@@ -1,11 +1,13 @@
 package tracing
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 	"path"
 	"reflect"
+	"strconv"
+	"sync"
 
 	"github.com/iancoleman/strcase"
 	"go.opentelemetry.io/otel/attribute"
@@ -73,21 +75,23 @@ func AttributesFrom(prefix string, obj any) []attribute.KeyValue {
 
 const traceTag = "trace"
 
-func attributesFrom(prefix string, obj any) []attribute.KeyValue {
-	rv := reflect.ValueOf(obj)
-	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
-		rv = rv.Elem()
+// structField is the precomputed metadata of a traced struct field.
+type structField struct {
+	index int
+	key   string // type prefix + snake_case field name
+}
+
+// structFields caches []structField per reflect.Type. The set of types is finite,
+// so the cache is bounded.
+var structFields sync.Map
+
+func fieldsOf(rt reflect.Type) []structField {
+	if cached, ok := structFields.Load(rt); ok {
+		return cached.([]structField)
 	}
 
-	if rv.Kind() != reflect.Struct {
-		return nil // only structs are reflected into fields
-	}
-
-	rt := rv.Type()
-	attrs := make([]attribute.KeyValue, 0, rt.NumField())
-
-	prefixBytes := getNamePrefix(rt)
-
+	typePrefix := getNamePrefix(rt)
+	fields := make([]structField, 0, rt.NumField())
 	for i := 0; i < rt.NumField(); i++ {
 		field := rt.Field(i)
 		if !field.IsExported() {
@@ -103,10 +107,28 @@ func attributesFrom(prefix string, obj any) []attribute.KeyValue {
 		if tag != "" {
 			fieldName = tag
 		}
+		fields = append(fields, structField{index: i, key: typePrefix + strcase.ToSnake(fieldName)})
+	}
 
-		if av, ok := attributeValue(rv.Field(i)); ok {
-			key := attribute.Key(prefix + string(prefixBytes) + strcase.ToSnake(fieldName))
-			attrs = append(attrs, attribute.KeyValue{Key: key, Value: av})
+	cached, _ := structFields.LoadOrStore(rt, fields)
+	return cached.([]structField)
+}
+
+func attributesFrom(prefix string, obj any) []attribute.KeyValue {
+	rv := reflect.ValueOf(obj)
+	if rv.Kind() == reflect.Pointer && !rv.IsNil() {
+		rv = rv.Elem()
+	}
+
+	if rv.Kind() != reflect.Struct {
+		return nil // only structs are reflected into fields
+	}
+
+	fields := fieldsOf(rv.Type())
+	attrs := make([]attribute.KeyValue, 0, len(fields))
+	for _, f := range fields {
+		if av, ok := attributeValue(rv.Field(f.index)); ok {
+			attrs = append(attrs, attribute.KeyValue{Key: attribute.Key(prefix + f.key), Value: av})
 		}
 	}
 
@@ -114,7 +136,7 @@ func attributesFrom(prefix string, obj any) []attribute.KeyValue {
 }
 
 func attributeValue(v reflect.Value) (attribute.Value, bool) {
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		if v.IsNil() {
 			return attribute.Value{}, false
 		}
@@ -126,29 +148,36 @@ func attributeValue(v reflect.Value) (attribute.Value, bool) {
 		return attribute.StringValue(v.String()), true
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return attribute.Int64Value(v.Int()), true
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return attribute.Int64Value(int64(v.Uint())), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u := v.Uint()
+		if u > math.MaxInt64 {
+			// Does not fit into int64 — keep the exact value as a string.
+			return attribute.StringValue(strconv.FormatUint(u, 10)), true
+		}
+		return attribute.Int64Value(int64(u)), true
 	case reflect.Float32, reflect.Float64:
 		return attribute.Float64Value(v.Float()), true
 	case reflect.Bool:
 		return attribute.BoolValue(v.Bool()), true
 	case reflect.Struct, reflect.Map, reflect.Slice, reflect.Array:
-		data, _ := json.Marshal(v.Interface())
+		if !v.CanInterface() {
+			return attribute.Value{}, false
+		}
+		data, err := json.Marshal(v.Interface())
+		if err != nil {
+			return attribute.Value{}, false
+		}
 		return attribute.StringValue(string(data)), true
 	default:
 		return attribute.Value{}, false
 	}
 }
 
-func getNamePrefix(rt reflect.Type) []byte {
-	var buf bytes.Buffer
-
+func getNamePrefix(rt reflect.Type) string {
 	// Allow custom prefix via anonymous _ field with trace tag
 	if sf, ok := rt.FieldByName("_"); ok {
 		if tag := sf.Tag.Get(traceTag); tag != "" {
-			buf.WriteString(tag)
-			buf.WriteByte('.')
-			return buf.Bytes()
+			return tag + "."
 		}
 	}
 
@@ -157,10 +186,8 @@ func getNamePrefix(rt reflect.Type) []byte {
 	if pkg == "." || pkg == "" {
 		pkg = "struct"
 	}
-	buf.WriteString(pkg)
-	buf.WriteByte('.')
-	buf.WriteString(strcase.ToSnake(rt.Name()))
-	buf.WriteByte('.')
-
-	return buf.Bytes()
+	if rt.Name() == "" {
+		return pkg + "."
+	}
+	return pkg + "." + strcase.ToSnake(rt.Name()) + "."
 }

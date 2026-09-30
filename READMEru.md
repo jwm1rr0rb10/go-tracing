@@ -7,7 +7,7 @@
 Включает в себя:
 - Настройка экспортера HTTP OTLP с разумными значениями по умолчанию
 - Автоматическая отправка метаданных сервиса (имя, версия, окружение, идентификатор экземпляра)
-- Высокопроизводительное HTTP-промежуточное ПО с кэшированием обработчиков
+- HTTP-промежуточное ПО с именами спанов по маршрутам
 - Современная трассировка gRPC-клиента и сервера с использованием рекомендуемого API `StatsHandler`
 - Богатый набор вспомогательных атрибутов (`TraceAny`, `TraceValue`, `Error`), работающих со структурами, картами, JSON и пользовательскими типами
 
@@ -18,9 +18,13 @@
 ## Особенности
 
 - **Простая инициализация** с помощью функциональных параметров
-- **Нулевые настройки по умолчанию** (localhost:4318, разумные атрибуты ресурсов)
-- **Кэшируемое HTTP-промежуточное ПО** — отсутствие накладных расходов на каждый запрос после первого вызова
+- **Нулевые настройки по умолчанию** (localhost:4318, gzip, разумные атрибуты ресурсов)
+- **Настройки для высокой нагрузки**: доля сэмплирования, настройка batch-процессора, TLS, заголовки авторизации, лимит размера атрибутов
+- **HTTP-промежуточное ПО с ограниченной кардинальностью** — имена спанов по шаблонам маршрутов, без состояния на каждый путь
 - **Современная поддержка gRPC** (сервер и клиент) с использованием текущего API `StatsHandler`
+- **OTLP по HTTP или gRPC**, стандартные переменные `OTEL_*`, автоопределение ресурса (хост/процесс/контейнер)
+- **Полная передача контекста**: входящие/исходящие HTTP и gRPC, W3C TraceContext + Baggage
+- **Корреляция с логами** через `slog.Handler`, добавляющий `trace_id` / `span_id`
 - **Удобная инъекция атрибутов** из структур с тегами `trace` и пользовательскими префиксами
 - **Корректное завершение работы** вспомогательная функция
 - **Крошечный и идиоматический** — никакой магии, просто чистый Go
@@ -87,11 +91,25 @@ func handleRequest(ctx context.Context, req MyRequest) error {
 | Option                  | Description            | Default   |
 |:------------------------|:-----------------------|:----------|
 | WithHost(host)          | OTLP collector host    | localhost |
-| WithPort(port)          | OTLP collector port    | 4318      |
+| WithPort(port)          | OTLP collector port    | 4318 (HTTP) / 4317 (gRPC) |
 | WithServiceName(name)   | Service name           | (empty)   |
 | WithServiceVersion(ver) | Service version        | (empty)   |
 | WithServiceID(id)       | Unique instance ID     | (empty)   |
 | WithEnvName(env)        | Deployment environment | (empty)   |
+| WithSampleRatio(r)                  | Доля сэмплируемых новых трейсов (0..1), решение родителя соблюдается | 1.0 (ParentBased) |
+| WithSampler(s)                      | Свой sampler (приоритетнее ratio) | — |
+| WithTLS(cfg)                        | Включить TLS для экспортёра | insecure |
+| WithHeaders(map)                    | Заголовки запросов экспорта (авторизация) | — |
+| WithExportTimeout(d)                | Таймаут запроса экспорта | 10s |
+| WithCompression(bool)               | Gzip-сжатие экспорта | true |
+| WithBatchOptions(opts...)           | Настройка batch-процессора (очередь, размер батча, таймаут) | SDK defaults |
+| WithAttributeValueLengthLimit(n)    | Макс. длина строковых атрибутов (<0 — без лимита) | 4096 |
+| WithProtocol(p)                     | `ProtocolHTTP` или `ProtocolGRPC` | HTTP (или `OTEL_EXPORTER_OTLP_PROTOCOL`) |
+| WithResourceAttributes(kv...)       | Доп. атрибуты ресурса (команда, регион, ...) | — |
+| WithPropagator(p)                   | Заменить пропагатор (например, добавить B3 для legacy-сервисов) | TraceContext + Baggage |
+| WithExporter(e)                     | Свой экспортёр вместо OTLP (stdout, in-memory для тестов) | OTLP |
+| WithSpanProcessor(sp)               | Дополнительный span processor | — |
+| WithErrorHandler(fn)                | Получать внутренние ошибки OTel (неудачный экспорт, потерянные спаны) | стандартный логгер |
 
 Пример с полной конфигурацией:
 
@@ -105,6 +123,37 @@ tp, err := tracing.New(
 )
 ```
 
+### Переменные окружения
+
+Поддерживаются стандартные переменные OpenTelemetry, явные опции имеют приоритет:
+
+| Переменная | Когда используется |
+|:--|:--|
+| `OTEL_EXPORTER_OTLP_(TRACES_)ENDPOINT` | не задан ни `WithHost`, ни `WithPort` |
+| `OTEL_EXPORTER_OTLP_(TRACES_)PROTOCOL` | не задан `WithProtocol` |
+| `OTEL_EXPORTER_OTLP_(TRACES_)HEADERS` | не задан `WithHeaders` |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | не задан ни `WithSampler`, ни `WithSampleRatio` |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | соответствующая опция пустая |
+| `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_SPAN_*_COUNT_LIMIT` | не задан `WithAttributeValueLengthLimit` |
+
+Ресурс также содержит автоматически определённые `host.*`, `os.type`, `process.pid`, `process.runtime.*` и `container.id`.
+
+### Рекомендации для высокой нагрузки
+
+```go
+tp, err := tracing.New(
+	tracing.WithServiceName("payments-api"),
+	tracing.WithSampleRatio(0.05), // сэмплировать 5% новых трейсов
+	tracing.WithBatchOptions(
+		sdktrace.WithMaxQueueSize(8192),
+		sdktrace.WithMaxExportBatchSize(1024),
+	),
+)
+```
+
+- По умолчанию сэмплируется **100% трейсов** — под нагрузкой задайте `WithSampleRatio`.
+- При переполнении очереди спаны отбрасываются (без блокировки) — подбирайте размер очереди под пиковый RPS.
+
 ---
 
 ## HTTP Middleware
@@ -116,9 +165,20 @@ mux.HandleFunc("/api/users", handler)
 http.ListenAndServe(":8080", tracing.Middleware(mux))
 ```
 
-- Имя Span = `"METHOD /path"` (например, POST `/api/users`)
-- Автоматическое распространение контекста трассировки
-- Кэширование — оболочка `otelhttp` создается только один раз для каждого маршрута (высокая производительность)
+- Имя Span = шаблон маршрута `http.ServeMux` (например, `GET /users/{id}`), либо только HTTP-метод, если маршрут не найден — сырые пути не используются, поэтому кардинальность спанов и память ограничены
+- Автоматическое распространение контекста трассировки (W3C TraceContext + Baggage)
+- Для других роутеров передайте свой форматтер: `tracing.NewMiddleware(otelhttp.WithSpanNameFormatter(f))`
+- Паники помечают спан как ошибку и пробрасываются дальше
+- Исключение шумных эндпоинтов: `tracing.NewMiddleware(tracing.WithSkipPaths("/healthz", "/metrics"))`
+- Для эндпоинтов, открытых в интернет, добавьте `otelhttp.WithPublicEndpoint()`: недоверенный входящий `traceparent` тогда начинает новый трейс (со ссылкой на входящий), а не навязывает решение о сэмплировании
+
+### HTTP-клиент
+
+```go
+client := &http.Client{Transport: tracing.NewTransport(nil)} // nil = http.DefaultTransport
+```
+Исходящие запросы получают клиентские спаны и передают контекст трассировки.
+
 
 ---
 
@@ -179,12 +239,37 @@ attrs := tracing.AttributesFrom("prefix", obj)  // get []attribute.KeyValue
 
 ---
 
+## Корреляция с логами
+
+```go
+slog.SetDefault(slog.New(tracing.NewSlogHandler(slog.NewJSONHandler(os.Stdout, nil))))
+
+slog.InfoContext(ctx, "payment processed") // добавит trace_id и span_id
+```
+
+`tracing.TraceIDFromContext(ctx)` / `tracing.SpanIDFromContext(ctx)` возвращают идентификаторы для других логгеров или заголовков ответа.
+
+---
+
+## Тестирование
+
+```go
+exp := tracetest.NewInMemoryExporter()
+tp, _ := tracing.New(tracing.WithExporter(exp))
+// ... тестируемый код ...
+_ = tracing.ForceFlush(ctx, tp)
+spans := exp.GetSpans()
+```
+
+---
+
 ## Shutdown
 ```go
 defer tracing.Shutdown(context.Background(), tp)
 ```
 
-Корректно завершает работу поставщика трассировки и очищает оставшиеся сегменты.
+Корректно завершает работу поставщика трассировки и выгружает оставшиеся спаны. Используйте контекст с таймаутом, чтобы завершение не зависло.
+`tracing.ForceFlush(ctx, tp)` выгружает накопленные спаны без остановки (например, в serverless-обработчиках).
 
 ---
 
