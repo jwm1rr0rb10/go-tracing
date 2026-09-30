@@ -33,6 +33,8 @@ Perfect for microservices, APIs, and any Go application that wants clean, observ
 
 ## Installation
 
+Requires **Go 1.27.1+**.
+
 ```bash
 go get github.com/jwm1rr0rb10/go-tracing
 ```

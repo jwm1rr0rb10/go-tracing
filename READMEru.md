@@ -32,6 +32,8 @@
 
 ## Установка
 
+Требуется **Go 1.27.1+**.
+
 ```bash
 go get github.com/jwm1rr0rb10/go-tracing
 ```
